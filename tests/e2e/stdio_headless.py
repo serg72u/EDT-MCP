@@ -51,6 +51,74 @@ def call(client, name, arguments):
     return response["result"]
 
 
+def bootstrap_runtime(jar):
+    """The runtime the given launcher resolves: its own ABI pointer, else the legacy pointer."""
+    directory = Path(jar).parent
+    for pointer in sorted(directory.glob("current-abi-*")):
+        name = pointer.read_text(encoding="utf-8").strip()
+        runtime = directory / name
+        if runtime.is_file():
+            return runtime
+    return directory / directory.joinpath("current").read_text(encoding="utf-8").strip()
+
+
+def run_command_stop(java, install, root):
+    """The external stop command against its own real host: the wrapper's exact call.
+
+    A second host and workspace, because the first one has already saved and stopped. Exit 0 is the
+    only code that says the workspace was closed cleanly, so a kill or a timeout must not pass.
+    """
+    workspace = root / "command-stop-workspace"
+    workspace.mkdir()
+    log = root / "command-stop.log"
+    environment = host_environment(root / "project")
+    platform_home = root / "command-stop-home"
+    platform_home.mkdir()
+    environment["HOME"] = str(platform_home)
+    with log.open("wb") as output:
+        host = subprocess.Popen(launch_command(java, install, workspace), env=environment,
+                                stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + int(os.environ.get("E2E_PROJECT_READY_TIMEOUT", "1200"))
+            while True:
+                if host.poll() is not None:
+                    raise AssertionError("Command-stop host exited before IPC; inspect " + str(log))
+                try:
+                    jar, _ = discover(workspace)
+                    break
+                except (AssertionError, OSError):
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("Command-stop host did not publish IPC; inspect " + str(log)) from None
+                    time.sleep(1)
+            runtime = bootstrap_runtime(jar)
+            # Reap the host while the CLI is still running. On Linux an unreaped child can
+            # still look alive to ProcessHandle, making the two processes wait for each other.
+            with subprocess.Popen(
+                [str(java), "-cp", str(runtime), "com.ditrix.edt.mcp.server.ipc.HostShutdownClient",
+                 "-data", str(workspace), "-timeout", "180"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                text=True,
+            ) as stop:
+                try:
+                    deadline = time.monotonic() + 300
+                    while host.poll() is None and stop.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.1)
+                    _, stderr = stop.communicate(timeout=max(0, deadline - time.monotonic()))
+                    assert stop.returncode == 0, (
+                        "The host must accept the stop command and exit cleanly: exit "
+                        + str(stop.returncode) + " stderr=" + stderr.strip())
+                    assert host.wait(timeout=5) == 0, "An accepted stop must be a clean exit, not a kill"
+                finally:
+                    if stop.poll() is None:
+                        stop.kill()
+            command_log = (workspace / ".metadata/.log").read_text(encoding="utf-8", errors="replace")
+            assert "EDT MCP headless workspace saved" in command_log, "The stop command must save the workspace"
+        finally:
+            if host.poll() is None:
+                host.kill()
+                host.wait(timeout=60)
+
+
 def main():
     if os.name != "posix":
         raise AssertionError("This acceptance starts a Linux host directly; Windows cold start is a separate live check")
@@ -160,7 +228,8 @@ def main():
             assert "EDT MCP headless host failed" not in workspace_log
             assert "Failed to auto-start MCP Server" not in workspace_log
             assert "MCP Server auto-started on port" not in workspace_log
-            print("stdio headless: real BSL/BM reads, confirmed writes checked on disk, read-only preset bypass, UI refusal, pure stdout, idle save PASS")
+            run_command_stop(java, install, root)
+            print("stdio headless: real BSL/BM reads, confirmed writes checked on disk, read-only preset bypass, UI refusal, pure stdout, idle save, command stop with clean save PASS")
         finally:
             if client is not None:
                 client.close()
