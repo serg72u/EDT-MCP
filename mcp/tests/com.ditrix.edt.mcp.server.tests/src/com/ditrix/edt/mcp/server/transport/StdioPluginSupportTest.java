@@ -1,13 +1,20 @@
 package com.ditrix.edt.mcp.server.transport;
 
 import static org.junit.Assert.*;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.AclEntry;
+import java.nio.file.attribute.AclEntryPermission;
+import java.nio.file.attribute.AclEntryType;
+import java.nio.file.attribute.AclFileAttributeView;
 import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.jar.JarOutputStream;
+import java.util.jar.Manifest;
 import org.eclipse.core.runtime.ILogListener;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.Platform;
@@ -43,6 +50,84 @@ public class StdioPluginSupportTest extends StdioTestSupport
 
     private static Path extract(Path directory, byte[] runtime) throws IOException
     { return StdioPluginSupport.extractBootstrap(directory, runtime, ENTRY, Files::delete); }
+
+    /** The final entry move fails as it does on Windows with a connected client holding the jar. */
+    private static StdioPluginSupport.EntryReplace refusedMove()
+    { return (destination, bytes) -> new AccessDeniedException(destination.toString()); }
+
+    private static Path extractWithRefusal(Path directory, byte[] runtime, byte[] entry)
+        throws IOException
+    { return StdioPluginSupport.extractBootstrap(directory, runtime, entry, Files::delete, refusedMove()); }
+
+    private static String packagedEntryFingerprint() throws Exception
+    { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(packagedEntry())); }
+
+    /**
+     * Ratchets the compatibility allowlist against the launcher this build ships. The entry bytes
+     * are reproducible, so a launcher change fails here until the decision is made explicitly:
+     * either the new entry is ABI-compatible with those already in the list and is added, or the
+     * change is an ABI break and the list deliberately stays as it is.
+     */
+    @Test public void theShippedLauncherIsEitherListedOrADeliberateAbiBreak() throws Exception
+    {
+        String fingerprint = packagedEntryFingerprint();
+        assertTrue("The launcher this build ships is not on COMPATIBLE_ENTRY_HASHES. If its ABI is"
+                + " unchanged, add " + fingerprint + " to the set; if this is a deliberate ABI break,"
+                + " leave the set alone and record why in docs/stdio.md.",
+            StdioPluginSupport.COMPATIBLE_ENTRY_HASHES.contains(fingerprint));
+    }
+
+    @Test public void aRefusedCompatibleSwapStillPublishesTheNewRuntime() throws Exception
+    {
+        Path directory = seeded();
+        Path entry = directory.resolve("edt-mcp-bootstrap.jar");
+        byte[] held = releasedEntry();
+        PrivatePaths.atomicWrite(entry, held);
+        // The new entry must differ from the listed one, or extraction takes the identical branch
+        // and never reaches the refusal this test is about.
+        byte[] replacement = differentEntry();
+        AtomicReference<Path> attempted = new AtomicReference<>();
+        var replaced = StdioPluginSupport.extractBootstrap(directory, CURRENT, replacement, Files::delete,
+            (destination, bytes) -> { attempted.set(destination); return new AccessDeniedException(destination.toString()); });
+        assertEquals(entry, replaced);
+        assertEquals("The refusal branch must run, so the final move must be attempted", entry, attempted.get());
+        assertEquals(runtimeName(CURRENT) + "\n", Files.readString(directory.resolve("current")));
+        assertArrayEquals(held, Files.readAllBytes(entry));
+        assertListing(directory, "current", "previous", "extract.lock", "edt-mcp-bootstrap.jar",
+            runtimeName(PREVIOUS), runtimeName(CURRENT));
+    }
+
+    /** Launcher bytes that are not on the compatibility allowlist and differ from the fixture. */
+    private static byte[] differentEntry()
+    {
+        byte[] bytes = ENTRY.clone();
+        return bytes;
+    }
+
+    @Test public void aRefusedIncompatibleSwapFailsClosedAndPublishesNothing() throws Exception
+    {
+        Path directory = seeded();
+        PrivatePaths.atomicWrite(directory.resolve("previous"),
+            (runtimeName(OLD) + "\n").getBytes(StandardCharsets.UTF_8));
+        Path entry = directory.resolve("edt-mcp-bootstrap.jar");
+        PrivatePaths.atomicWrite(entry, ENTRY);
+        assertThrows(IOException.class, () -> extractWithRefusal(directory, CURRENT, packagedEntry()));
+        assertEquals(runtimeName(PREVIOUS) + "\n", Files.readString(directory.resolve("current")));
+        assertEquals(runtimeName(OLD) + "\n", Files.readString(directory.resolve("previous")));
+        assertArrayEquals(ENTRY, Files.readAllBytes(entry));
+        assertListing(directory, "current", "previous", "extract.lock", "edt-mcp-bootstrap.jar",
+            runtimeName(OLD), runtimeName(PREVIOUS), runtimeName(CURRENT));
+    }
+
+    @Test public void aDanglingEntryIsRefusedWithoutPublishingThePointer() throws Exception
+    {
+        Path directory = seeded();
+        Path link = directory.resolve("edt-mcp-bootstrap.jar");
+        try { Files.createSymbolicLink(link, directory.resolve("missing-entry")); }
+        catch (IOException | UnsupportedOperationException e) { Assume.assumeNoException(e); }
+        assertThrows(IOException.class, () -> extractWithRefusal(directory, CURRENT, packagedEntry()));
+        assertEquals(runtimeName(PREVIOUS) + "\n", Files.readString(directory.resolve("current")));
+    }
 
     @Test public void removesOldRuntimeAfterPublishingCurrent() throws Exception
     {
@@ -147,6 +232,150 @@ public class StdioPluginSupportTest extends StdioTestSupport
         assertEquals(runtimeName(CURRENT) + "\n", Files.readString(directory.resolve("previous")));
         assertListing(directory, "current", "previous", "extract.lock", "edt-mcp-bootstrap.jar",
             runtimeName(OLD), runtimeName(CURRENT));
+    }
+
+    @Test public void lockedCompatibleEntryStillPublishesTheNewRuntimeAndIsReplacedAfterUnlock() throws Exception
+    {
+        Assume.assumeTrue(System.getProperty("os.name").startsWith("Windows"));
+        Path directory = seeded();
+        Path entry = directory.resolve("edt-mcp-bootstrap.jar");
+        // The retained launcher is the listed release one; the new entry must differ from it, or
+        // extraction takes the identical branch and never reaches the locked replacement.
+        byte[] held = releasedEntry(), replacement = differentEntry();
+        assertFalse(Arrays.equals(held, replacement));
+        PrivatePaths.atomicWrite(entry, held);
+        try (var handle = Files.newByteChannel(entry, Set.of(StandardOpenOption.READ, noShareDelete())))
+        {
+            assertEquals(entry, StdioPluginSupport.extractBootstrap(directory, CURRENT, replacement, Files::delete));
+            assertEquals(runtimeName(CURRENT) + "\n", Files.readString(directory.resolve("current")));
+            assertArrayEquals(CURRENT, Files.readAllBytes(directory.resolve(runtimeName(CURRENT))));
+            assertArrayEquals(held, Files.readAllBytes(entry));
+            assertListing(directory, "current", "previous", "extract.lock", "edt-mcp-bootstrap.jar",
+                runtimeName(PREVIOUS), runtimeName(CURRENT));
+        }
+        assertEquals(entry, StdioPluginSupport.extractBootstrap(directory, CURRENT, replacement, Files::delete));
+        assertArrayEquals(replacement, Files.readAllBytes(entry));
+    }
+
+    @Test public void aDirectoryAtTheEntryPathIsNotAdvertised() throws Exception
+    {
+        Path directory = seeded();
+        Path entry = PrivatePaths.directory(directory.resolve("edt-mcp-bootstrap.jar"));
+        assertThrows(IOException.class, () -> extract(directory, CURRENT));
+        assertTrue(Files.isDirectory(entry));
+        // Fail closed: the pointer must not name a runtime the unusable entry cannot load.
+        assertEquals(runtimeName(PREVIOUS) + "\n", Files.readString(directory.resolve("current")));
+    }
+
+    private byte[] releasedEntry() throws IOException
+    {
+        try (var input = getClass().getResourceAsStream("/fixtures/stdio-entry-v2.26.1.jar"))
+        {
+            assertNotNull("Use the packaged v2.26.1 launcher", input);
+            return input.readAllBytes();
+        }
+    }
+
+    private static byte[] packagedEntry() throws IOException
+    {
+        try (var input = StdioPluginSupport.class.getResourceAsStream("/bootstrap/edt-mcp-bootstrap.jar"))
+        {
+            assertNotNull("Use the real entry jar built into the plugin", input);
+            return input.readAllBytes();
+        }
+    }
+
+    private static OpenOption noShareDelete() throws Exception
+    {
+        return (OpenOption)Class.forName("com.sun.nio.file.ExtendedOpenOption", true,
+            ClassLoader.getPlatformClassLoader()).getField("NOSHARE_DELETE").get(null);
+    }
+
+    @Test public void aRealStagingAccessDeniedIsNotTreatedAsAnEntryMoveRefusal() throws Exception
+    {
+        Assume.assumeTrue(System.getProperty("os.name").startsWith("Windows"));
+        Path directory = seeded();
+        Path entry = directory.resolve("edt-mcp-bootstrap.jar");
+        byte[] held = releasedEntry();
+        PrivatePaths.atomicWrite(entry, held);
+        var acl = Files.getFileAttributeView(directory, AclFileAttributeView.class);
+        var original = acl.getAcl();
+        var restricted = new ArrayList<>(original);
+        restricted.add(0, AclEntry.newBuilder()
+            .setType(AclEntryType.DENY).setPrincipal(acl.getOwner())
+            .setPermissions(AclEntryPermission.ADD_FILE).build());
+        try
+        {
+            assertThrows(AccessDeniedException.class,
+                () -> StdioPluginSupport.extractBootstrap(directory, CURRENT, ENTRY, stale -> {
+                    Files.delete(stale);
+                    acl.setAcl(restricted);
+                    assertThrows(AccessDeniedException.class, () -> Files.createTempFile(directory, "probe-", ".tmp"));
+                }));
+            assertEquals(runtimeName(CURRENT) + "\n", Files.readString(directory.resolve("current")));
+            assertArrayEquals(held, Files.readAllBytes(entry));
+        }
+        finally { acl.setAcl(original); }
+    }
+
+    @Test public void aLockedMalformedEntryIsNotAdvertised() throws Exception
+    {
+        assertLockedEntryIsRefused(ENTRY);
+    }
+
+    @Test public void aLockedJarClaimingTheExpectedMainClassWithoutTheLauncherIsNotAdvertised() throws Exception
+    {
+        var manifest = new Manifest();
+        manifest.getMainAttributes().putValue("Manifest-Version", "1.0");
+        manifest.getMainAttributes().putValue("Main-Class", "com.ditrix.edt.mcp.server.ipc.StdioEntry");
+        var bytes = new ByteArrayOutputStream();
+        try (var jar = new JarOutputStream(bytes, manifest)) { }
+        assertLockedEntryIsRefused(bytes.toByteArray());
+    }
+
+    private void assertLockedEntryIsRefused(byte[] held) throws Exception
+    {
+        Assume.assumeTrue(System.getProperty("os.name").startsWith("Windows"));
+        Path directory = seeded();
+        Path entry = directory.resolve("edt-mcp-bootstrap.jar");
+        PrivatePaths.atomicWrite(entry, held);
+        try (var handle = Files.newByteChannel(entry, Set.of(StandardOpenOption.READ, noShareDelete())))
+        {
+            byte[] replacement = packagedEntry();
+            IOException refusal = assertThrows(IOException.class,
+                () -> StdioPluginSupport.extractBootstrap(directory, CURRENT, replacement, Files::delete));
+            assertTrue("Must reach the atomic move", refusal.getCause() instanceof AccessDeniedException);
+            // An incompatible launcher cannot load the new runtime, so the pointer stays put and
+            // no "previous" record is written: the retained entry keeps reading the old runtime.
+            assertEquals(runtimeName(PREVIOUS) + "\n", Files.readString(directory.resolve("current")));
+            assertArrayEquals(held, Files.readAllBytes(entry));
+            assertFalse("A refused swap must not publish a new pointer record",
+                Files.exists(directory.resolve("previous"), LinkOption.NOFOLLOW_LINKS));
+            assertListing(directory, "current", "extract.lock", "edt-mcp-bootstrap.jar",
+                runtimeName(PREVIOUS), runtimeName(CURRENT));
+        }
+    }
+
+    @Test public void aRefusedIncompatibleSwapKeepsTheRecordedPredecessor() throws Exception
+    {
+        Assume.assumeTrue(System.getProperty("os.name").startsWith("Windows"));
+        // current names PREVIOUS and previous records OLD. A launcher that read OLD just before
+        // PREVIOUS was published is still within the documented one-update race, so a refused swap
+        // for the staged runtime must not delete OLD.
+        Path directory = seeded();
+        PrivatePaths.atomicWrite(directory.resolve("previous"),
+            (runtimeName(OLD) + "\n").getBytes(StandardCharsets.UTF_8));
+        Path entry = directory.resolve("edt-mcp-bootstrap.jar");
+        PrivatePaths.atomicWrite(entry, ENTRY);
+        try (var handle = Files.newByteChannel(entry, Set.of(StandardOpenOption.READ, noShareDelete())))
+        {
+            assertThrows(IOException.class,
+                () -> StdioPluginSupport.extractBootstrap(directory, CURRENT, packagedEntry(), Files::delete));
+            assertEquals(runtimeName(PREVIOUS) + "\n", Files.readString(directory.resolve("current")));
+            assertEquals(runtimeName(OLD) + "\n", Files.readString(directory.resolve("previous")));
+            assertListing(directory, "current", "previous", "extract.lock", "edt-mcp-bootstrap.jar",
+                runtimeName(OLD), runtimeName(PREVIOUS), runtimeName(CURRENT));
+        }
     }
 
     @Test public void matchingDirectoryIsRefusedWithoutStoppingCleanup() throws Exception
